@@ -1,3 +1,24 @@
+
+'''
+OCR DATASET CLASS
+Dataset Used = BanglaWriting
+Dataset Manual = https://arxiv.org/pdf/2011.07499.pdf
+Dataset Download Link - https://data.mendeley.com/datasets/r43wkvdk4w/1
+
+
+
+import Levenshtein
+edit_distances = [Levenshtein.distance(t, p) for t, p in zip(test_orig_targets, valid_word_preds)]
+
+
+
+import difflib
+edit_distances = [sum(1 for _ in difflib.ndiff(t, p) if _.startswith('+ ') or _.startswith('- ')) for t, p in zip(test_orig_targets, valid_word_preds)]
+
+    
+'''
+
+
 import os
 import glob
 import torch
@@ -5,6 +26,7 @@ import pprint
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+import Levenshtein
 
 from PIL import Image
 from tqdm import tqdm
@@ -16,12 +38,7 @@ from sklearn import metrics
 from sklearn import preprocessing
 from sklearn import model_selection
 
-'''
-    OCR DATASET CLASS
-    Dataset Used = BanglaWriting
-    Dataset Manual = https://arxiv.org/pdf/2011.07499.pdf
-    Dataset Download Link - https://data.mendeley.com/datasets/r43wkvdk4w/1
-'''
+
 
 class OCRDataset(Dataset):
     
@@ -39,7 +56,15 @@ class OCRDataset(Dataset):
         targets = self.targets[item]
 
         image = np.array(image)
-        image = np.stack((image,)*1, axis=-1)
+        # Convert to grayscale if image is in color
+        if len(image.shape) == 3 and image.shape[2] > 1:
+            image = np.mean(image, axis=2).astype(np.uint8)
+        
+        # Ensure it's a single channel image
+        image = np.expand_dims(image, axis=2)
+
+        # Normalize image to [0,1] range
+        image = image / 255.0
 
         # Reshape to tensor format supported by Pytorch (C, H, W)
         image = np.transpose(image, (2, 0, 1)).astype(np.float32)
@@ -69,7 +94,7 @@ class OCRModel(nn.Module):
         x = F.relu(self.conv_1(images))
         x = self.pool_1(x)
         x = F.relu(self.conv_2(x))
-        x = self.pool_2(x)  # [bs, 64, 16, 29] (bs, c, h, w)
+        x = self.pool_2(x)  # [bs, 64, 16, ?] (bs, c, h, w)
         
         x = x.permute(0, 3, 1, 2)  # bs, w, c, h
         x = x.view(bs, x.size(1), -1)
@@ -82,14 +107,24 @@ class OCRModel(nn.Module):
         x = x.permute(1, 0, 2)
 
         if targets is not None:
-            log_probs = F.log_softmax(x, 2).to(torch.float64)
+            log_probs = F.log_softmax(x, 2)
             input_lengths = torch.full(
                 size=(bs,), fill_value=log_probs.size(0), dtype=torch.int32
             )
-            target_lengths = torch.full(
-                size=(bs,), fill_value=targets.size(1), dtype=torch.int32
-            )
-            loss = nn.CTCLoss(blank=0)(
+            
+            # Calculate actual lengths of targets (excluding padding zeros)
+            target_lengths = []
+            for i in range(bs):
+                count = 0
+                for j in range(targets.size(1)):
+                    if targets[i, j] != 0:
+                        count += 1
+                target_lengths.append(max(1, count))  # Ensure at least length 1
+            
+            target_lengths = torch.tensor(target_lengths, dtype=torch.int32)
+            
+            # Use targets directly - CTC loss expects a flattened tensor
+            loss = nn.CTCLoss(blank=0, reduction='mean')(
                 log_probs, targets, input_lengths, target_lengths
             )
             return x, loss
@@ -98,18 +133,16 @@ class OCRModel(nn.Module):
 
 
 def remove_duplicates(x):
-    if len(x) < 2:
-        return x
-    fin = ""
-    for j in x:
-        if fin == "":
-            fin = j
-        else:
-            if j == fin[-1]:
-                continue
-            else:
-                fin = fin + j
-    return fin
+    result = []
+    prev_char = None
+    
+    for char in x:
+        if char != prev_char:  # Only add if not the same as previous
+            result.append(char)
+            prev_char = char
+    
+    # Remove blank characters (represented by '°') and join
+    return ''.join([c for c in result if c != '°'])
 
 
 def decode_predictions(preds, encoder):
@@ -118,17 +151,26 @@ def decode_predictions(preds, encoder):
     preds = torch.argmax(preds, 2)
     preds = preds.detach().cpu().numpy()
     word_preds = []
+    
     for j in range(preds.shape[0]):
         temp = []
         for k in preds[j, :]:
-            k = k - 1
-            if k == -1:
-                temp.append("°")
+            if k == 0:  # This is the blank token in CTC
+                temp.append('°')
             else:
-                p = encoder.inverse_transform([k])[0]
-                temp.append(p)
+                # Adjust index to match encoder (subtract 1)
+                try:
+                    p = encoder.classes_[k-1]
+                    temp.append(p)
+                except IndexError:
+                    # Handle index errors gracefully
+                    temp.append('°')
+        
+        # Join characters and remove duplicates
         tp = "".join(temp)
-        word_preds.append(remove_duplicates(tp))
+        cleaned = remove_duplicates(tp)
+        word_preds.append(cleaned)
+    
     return word_preds
 
 
@@ -159,7 +201,8 @@ def eval_fn(model, data_loader):
             for key, value in data.items():
                 data[key] = value.to("cuda" if torch.cuda.is_available() else "cpu")
             batch_preds, loss = model(**data)
-            fin_loss += loss.item()
+            if loss is not None:
+                fin_loss += loss.item()
             fin_preds.append(batch_preds)
         return fin_preds, fin_loss / len(data_loader)
 
@@ -182,6 +225,12 @@ def visualize_sample(dataset, index):
     plt.show()
 
 
+def clean_target(text):
+    # Remove non-letter characters and standardize for comparison
+    # This step depends on your specific dataset
+    return ''.join(c for c in text if c.isalnum()).lower()
+
+
 def main():
     filepath = './img'
     print('Training process started')
@@ -202,12 +251,29 @@ def main():
         target = filename.split(" ")[0]
         targets_orig.append(target)
     
-    targets = [[c for c in x] for x in targets_orig]
+    # Debug: Show original targets
+    print("Sample original targets:", targets_orig[:5])
+    
+    # Apply preprocessing for consistency
+    targets_clean = [clean_target(t) for t in targets_orig]
+    
+    # Split targets into characters
+    targets = [[c for c in x] for x in targets_clean]
     targets_flat = [c for clist in targets for c in clist]
+    
+    # Debug: Show unique characters
+    unique_chars = sorted(set(targets_flat))
+    print(f"Unique characters in dataset: {unique_chars}")
+    print(f"Total unique characters: {len(unique_chars)}")
     
     # Encode targets
     lbl_enc = preprocessing.LabelEncoder()
     lbl_enc.fit(targets_flat)
+    
+    # Debug: Show encoding mapping
+    print("Character encoding mapping:")
+    for i, c in enumerate(lbl_enc.classes_):
+        print(f"  {c} -> {i+1}")  # +1 because 0 is reserved for blank
     
     # Process targets character by character and encode them
     targets_enc = []
@@ -240,7 +306,7 @@ def main():
         train_orig_targets,
         test_orig_targets,
     ) = model_selection.train_test_split(
-        image_files, padded_targets, targets_orig, test_size=0.2, random_state=42
+        image_files, padded_targets, targets_clean, test_size=0.2, random_state=42
     )
     
     print(f"Training samples: {len(train_imgs)}, Testing samples: {len(test_imgs)}")
@@ -249,9 +315,16 @@ def main():
     train_dataset = OCRDataset(img_dir=train_imgs, targets=train_targets)
     test_dataset = OCRDataset(img_dir=test_imgs, targets=test_targets)
     
+    # Visualize a sample for debugging
+    if len(train_dataset) > 0:
+        print("\nVisualizing a training sample:")
+        sample = train_dataset[0]
+        print(f"Sample image shape: {sample['images'].shape}")
+        print(f"Sample target: {sample['targets']}")
+    
     # Defining the data loaders
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)  # Don't shuffle test data
     
     # Initialize model
     model = OCRModel(len(lbl_enc.classes_))
@@ -265,7 +338,9 @@ def main():
     )
 
     # Define number of epoch and start training
-    num_epoch = 10
+    num_epoch = 10000
+    best_accuracy = 0
+    
     for epoch in range(num_epoch):
         print(f"\nStarting Epoch {epoch+1}/{num_epoch}")
         train_loss = train_fn(model, train_loader, optimizer)
@@ -279,24 +354,49 @@ def main():
         # Remove any excess predictions if they don't match the target count
         valid_word_preds = valid_word_preds[:len(test_orig_targets)]
         
-        combined = list(zip(test_orig_targets, valid_word_preds))
-        print("Sample predictions:")
-        print(combined[:5])
+        # Debug: Show some predictions vs targets
+        print("\nSample predictions:")
+        for i in range(min(5, len(test_orig_targets))):
+            print(f"Target: '{test_orig_targets[i]}' → Pred: '{valid_word_preds[i]}'")
         
-        test_dup_rem = [remove_duplicates(c) for c in test_orig_targets]
-        accuracy = metrics.accuracy_score(test_dup_rem, valid_word_preds)
+        # Preprocessing targets and predictions for fair comparison
+        # For CTC, we need to compare without duplicates
+        accuracy = metrics.accuracy_score(test_orig_targets, valid_word_preds)
         
-        print(f"Epoch={epoch+1}, Train Loss={train_loss:.4f}, Test Loss={test_loss:.4f}, Accuracy={accuracy:.4f}")
+        # Calculate character error rate
+        total_chars = sum(len(t) for t in test_orig_targets)
+        # edit_distances = [metrics.edit_distance(t, p) for t, p in zip(test_orig_targets, valid_word_preds)]
+        edit_distances = [Levenshtein.distance(t, p) for t, p in zip(test_orig_targets, valid_word_preds)]
+
+        cer = sum(edit_distances) / total_chars if total_chars > 0 else 1.0
+        
+        print(f"Epoch={epoch+1}, Train Loss={train_loss:.4f}, Test Loss={test_loss:.4f}")
+        print(f"Accuracy={accuracy:.4f}, Character Error Rate={cer:.4f}")
+        
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            # Save the model
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': test_loss,
+                'accuracy': accuracy,
+                'label_encoder': lbl_enc,
+                'num_classes': len(lbl_enc.classes_)
+            }, "ocr_model_best.pth")
+            print(f"New best accuracy: {accuracy:.4f}. Model saved as ocr_model_best.pth")
+        
         scheduler.step(test_loss)
     
-    # Save the model
+    # Save the final model
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'label_encoder': lbl_enc,
         'num_classes': len(lbl_enc.classes_)
-    }, "ocr_model.pth")
-    print("Model saved successfully as ocr_model.pth")
+    }, "ocr_model_final.pth")
+    print("Final model saved successfully as ocr_model_final.pth")
 
 
 if __name__ == "__main__":

@@ -24,7 +24,10 @@ The dataset is not processed and it needs further preprocessing. From the raw im
 
 
 
-
+## Testing
+```bash
+python test.py --image_path path/to/your/image.jpg --model_path ocr_model_best.pth --visualize
+```
 
 ## Further Improvement can be done through:
 - Preprocessing such as skew correction, noise removal, thinning and skeletonization

@@ -2,3 +2,4 @@ numpy
 scikit-learn
 opencv-python
 tqdm
+python-Levenshtein
