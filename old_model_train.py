@@ -1,3 +1,24 @@
+
+'''
+OCR DATASET CLASS
+Dataset Used = BanglaWriting
+Dataset Manual = https://arxiv.org/pdf/2011.07499.pdf
+Dataset Download Link - https://data.mendeley.com/datasets/r43wkvdk4w/1
+
+
+
+import Levenshtein
+edit_distances = [Levenshtein.distance(t, p) for t, p in zip(test_orig_targets, valid_word_preds)]
+
+
+
+import difflib
+edit_distances = [sum(1 for _ in difflib.ndiff(t, p) if _.startswith('+ ') or _.startswith('- ')) for t, p in zip(test_orig_targets, valid_word_preds)]
+
+    
+'''
+
+
 import os
 import glob
 import torch
@@ -54,307 +75,37 @@ class OCRDataset(Dataset):
         }
 
 
+# defining the model
+class OCRModel(nn.Module):
+    def __init__(self, num_chars):
+        super(OCRModel, self).__init__()
+        self.conv_1 = nn.Conv2d(1, 128, kernel_size=(3, 6), padding=(1, 1))
+        self.pool_1 = nn.MaxPool2d(kernel_size=(2, 2))
+        self.conv_2 = nn.Conv2d(128, 64, kernel_size=(3, 6), padding=(1, 1))
+        self.pool_2 = nn.MaxPool2d(kernel_size=(2, 2))
+        
+        self.linear_1 = nn.Linear(1024, 64)  # 1024 = 64*16
+        self.drop_1 = nn.Dropout(0.2)
+        self.gru = nn.GRU(64, 32, bidirectional=True, num_layers=2, dropout=0.25, batch_first=True)
+        self.output = nn.Linear(64, num_chars + 1)
 
-
-
-
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-
-class Attention(nn.Module):
-    def __init__(self, hidden_size):
-        super(Attention, self).__init__()
-        self.hidden_size = hidden_size
-        self.attention_hidden_size = hidden_size // 2
-        
-        self.query = nn.Linear(hidden_size, self.attention_hidden_size)
-        self.key = nn.Linear(hidden_size, self.attention_hidden_size)
-        self.value = nn.Linear(hidden_size, hidden_size)
-        
-        self.scale = torch.sqrt(torch.FloatTensor([self.attention_hidden_size]))
-        
-    def forward(self, query, key, value, mask=None):
-        batch_size = query.shape[0]
-        
-        Q = self.query(query)
-        K = self.key(key)
-        V = self.value(value)
-        
-        energy = torch.matmul(Q, K.permute(0, 2, 1)) / self.scale.to(query.device)
-        
-        if mask is not None:
-            energy = energy.masked_fill(mask == 0, -1e10)
-            
-        attention = torch.softmax(energy, dim=-1)
-        
-        output = torch.matmul(attention, V)
-        
-        return output, attention
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
-        
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1)].detach()
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=kernel_size//2)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, 1, padding=kernel_size//2)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride),
-                nn.BatchNorm2d(out_channels)
-            )
-            
-    def forward(self, x):
-        residual = x
-        
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        
-        out += self.shortcut(residual)
-        out = F.relu(out)
-        
-        return out
-
-class SpatialTransformer(nn.Module):
-    def __init__(self, in_channels):
-        super(SpatialTransformer, self).__init__()
-        self.localization = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=5, padding=2),
-            nn.MaxPool2d(2),
-            nn.ReLU(True),
-            nn.Conv2d(64, 128, kernel_size=5, padding=2),
-            nn.MaxPool2d(2),
-            nn.ReLU(True)
-        )
-        
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((8, 16))
-        
-        self.fc_loc = nn.Sequential(
-            nn.Linear(128 * 8 * 16, 256),
-            nn.ReLU(True),
-            nn.Linear(256, 6)
-        )
-        
-        # Initialize transformation parameters
-        self.fc_loc[2].weight.data.zero_()
-        self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
-        
-    def forward(self, x):
-        xs = self.localization(x)
-        xs = self.adaptive_pool(xs)
-        xs = xs.view(-1, 128 * 8 * 16)
-        theta = self.fc_loc(xs)
-        theta = theta.view(-1, 2, 3)
-        
-        grid = F.affine_grid(theta, x.size(), align_corners=False)
-        x = F.grid_sample(x, grid, align_corners=False)
-        
-        return x
-
-class FeaturePyramidNetwork(nn.Module):
-    def __init__(self, in_channels_list, out_channels):
-        super(FeaturePyramidNetwork, self).__init__()
-        self.inner_blocks = nn.ModuleList()
-        self.layer_blocks = nn.ModuleList()
-        
-        for in_channels in in_channels_list:
-            self.inner_blocks.append(nn.Conv2d(in_channels, out_channels, 1))
-            self.layer_blocks.append(nn.Conv2d(out_channels, out_channels, 3, padding=1))
-            
-    def forward(self, features):
-        results = []
-        last_inner = None
-        
-        # Process features in reverse order (from high to low resolution)
-        for i, (feature, inner_block, layer_block) in enumerate(zip(
-            reversed(features), reversed(self.inner_blocks), reversed(self.layer_blocks)
-        )):
-            if last_inner is None:
-                inner_result = inner_block(feature)
-            else:
-                # Upsample and add
-                inner_result = inner_block(feature)
-                inner_result = inner_result + F.interpolate(
-                    last_inner, size=inner_result.shape[-2:], mode='nearest'
-                )
-                
-            last_inner = inner_result
-            results.insert(0, layer_block(inner_result))
-            
-        return results
-
-class ComplexOCRModel(nn.Module):
-    def __init__(self, num_chars, input_channels=1, hidden_size=1024):
-        super(ComplexOCRModel, self).__init__()
-        
-        self.hidden_size = hidden_size
-        
-        # Spatial Transformer for input preprocessing
-        self.stn = SpatialTransformer(input_channels)
-        
-        # Convolutional Backbone
-        self.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        
-        # Residual blocks
-        self.res_layers = nn.ModuleList([
-            ResidualBlock(64, 128),
-            ResidualBlock(128, 128),
-            ResidualBlock(128, 256, stride=2),
-            ResidualBlock(256, 256),
-            ResidualBlock(256, 512, stride=2),
-            ResidualBlock(512, 512),
-            ResidualBlock(512, 1024, stride=2),
-            ResidualBlock(1024, 1024)
-        ])
-        
-        # Feature Pyramid Network
-        self.fpn = FeaturePyramidNetwork([256, 512, 1024], 256)
-        
-        # Sequence encoder - now outputs hidden_size channels to match GRU input
-        self.sequence_encoder = nn.Sequential(
-            nn.Conv2d(256, 512, kernel_size=(3, 3), padding=(1, 1)),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm2d(512),
-            nn.Conv2d(512, hidden_size, kernel_size=(3, 3), padding=(1, 1)),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm2d(hidden_size),
-        )
-        
-        # Adaptive pooling to handle varying sequence lengths
-        self.adaptive_height_pool = nn.AdaptiveAvgPool2d((1, None))
-        
-        # Positional encoding
-        self.positional_encoding = PositionalEncoding(hidden_size)
-        
-        # Bidirectional GRU layers
-        self.gru_layers = nn.ModuleList([
-            nn.GRU(hidden_size, hidden_size//2, bidirectional=True, batch_first=True),
-            nn.GRU(hidden_size, hidden_size//2, bidirectional=True, batch_first=True),
-            nn.GRU(hidden_size, hidden_size//2, bidirectional=True, batch_first=True)
-        ])
-        
-        # Self-attention mechanism
-        self.self_attention = nn.ModuleList([
-            Attention(hidden_size) for _ in range(4)
-        ])
-        
-        # Fully connected layers for feature transformation
-        self.fc_layers = nn.ModuleList([
-            nn.Linear(hidden_size, hidden_size),
-            nn.Linear(hidden_size, hidden_size),
-            nn.Linear(hidden_size, hidden_size)
-        ])
-        
-        # Dropout layers
-        self.dropout = nn.Dropout(0.5)
-        
-        # Character prediction head
-        self.char_pred = nn.Sequential(
-            nn.Linear(hidden_size, 2048),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(2048, 1024),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(1024, num_chars + 1)  # +1 for blank in CTC
-        )
-        
-        # Additional hidden layers to increase model size
-        self.additional_layers = nn.ModuleList([
-            nn.Linear(hidden_size, hidden_size) for _ in range(30)
-        ])
-        
-        # Large parameter tensors to increase model size (approximately 192MB)
-        self.large_param1 = nn.Parameter(torch.randn(2000, 2000))
-        self.large_param2 = nn.Parameter(torch.randn(2000, 2000))
-        self.large_param3 = nn.Parameter(torch.randn(2000, 2000))
-        self.large_param4 = nn.Parameter(torch.randn(2000, 2000))
-        self.large_param5 = nn.Parameter(torch.randn(2000, 2000))
-        self.large_param6 = nn.Parameter(torch.randn(2000, 2000))
-        
     def forward(self, images, targets=None):
         bs, c, h, w = images.size()
+        x = F.relu(self.conv_1(images))
+        x = self.pool_1(x)
+        x = F.relu(self.conv_2(x))
+        x = self.pool_2(x)  # [bs, 64, 16, ?] (bs, c, h, w)
         
-        # Apply spatial transformer
-        x = self.stn(images)
+        x = x.permute(0, 3, 1, 2)  # bs, w, c, h
+        x = x.view(bs, x.size(1), -1)
+        x = F.relu(self.linear_1(x))
+        x = self.drop_1(x)
         
-        # Extract features through convolutional backbone
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.maxpool(x)
+        x, _ = self.gru(x)
+        x = self.output(x)
         
-        # Apply residual blocks and collect features for FPN
-        features = []
-        for i, layer in enumerate(self.res_layers):
-            x = layer(x)
-            # Collect features for FPN at specific layers
-            if i in [2, 4, 7]:  # After 256, 512, and 1024 channels
-                features.append(x)
-        
-        # Apply FPN to get multi-scale features
-        fpn_features = self.fpn(features)
-        
-        # Use the highest resolution feature map for sequence modeling
-        x = fpn_features[0]
-        
-        # Apply sequence encoder
-        x = self.sequence_encoder(x)
-        
-        # Collapse height dimension for sequence modeling
-        x = self.adaptive_height_pool(x)
-        x = x.squeeze(2)  # Remove height dimension
-        x = x.permute(0, 2, 1)  # [bs, seq_len, channels]
-        
-        # Apply positional encoding
-        x = self.positional_encoding(x)
-        
-        # Apply GRU layers with residual connections
-        gru_out = x
-        for i, gru in enumerate(self.gru_layers):
-            residual = gru_out
-            gru_out, _ = gru(gru_out)
-            gru_out = gru_out + residual
-            
-            # Apply self-attention after each GRU layer
-            if i < len(self.self_attention):
-                attn_out, _ = self.self_attention[i](gru_out, gru_out, gru_out)
-                gru_out = gru_out + attn_out
-                
-            # Apply fully connected transformation
-            if i < len(self.fc_layers):
-                fc_out = self.fc_layers[i](gru_out)
-                gru_out = gru_out + fc_out
-                
-            gru_out = self.dropout(gru_out)
-        
-        # Apply character prediction head
-        x = self.char_pred(gru_out)
-        
-        # Prepare for CTC loss
-        x = x.permute(1, 0, 2)  # [seq_len, bs, num_classes]
-        
+        x = x.permute(1, 0, 2)
+
         if targets is not None:
             log_probs = F.log_softmax(x, 2)
             input_lengths = torch.full(
@@ -372,23 +123,15 @@ class ComplexOCRModel(nn.Module):
             
             target_lengths = torch.tensor(target_lengths, dtype=torch.int32)
             
-            # Use CTC loss
+            # Use targets directly - CTC loss expects a flattened tensor
             loss = nn.CTCLoss(blank=0, reduction='mean')(
                 log_probs, targets, input_lengths, target_lengths
             )
             return x, loss
-        
+
         return x, None
-    
-    def count_parameters(self):
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-    
-    
-    
-    
-    
-    
-    
+
+
 def remove_duplicates(x):
     result = []
     prev_char = None
@@ -584,7 +327,7 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)  # Don't shuffle test data
     
     # Initialize model
-    model = ComplexOCRModel(len(lbl_enc.classes_))
+    model = OCRModel(len(lbl_enc.classes_))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     model.to(device)
@@ -595,7 +338,7 @@ def main():
     )
 
     # Define number of epoch and start training
-    num_epoch = 2
+    num_epoch = 10000
     best_accuracy = 0
     
     for epoch in range(num_epoch):
@@ -641,8 +384,8 @@ def main():
                 'accuracy': accuracy,
                 'label_encoder': lbl_enc,
                 'num_classes': len(lbl_enc.classes_)
-            }, "models/ocr_model_final.pth")
-            print(f"New best accuracy: {accuracy:.4f}. Model saved as models/ocr_model_final.pth")
+            }, "ocr_model_best.pth")
+            print(f"New best accuracy: {accuracy:.4f}. Model saved as ocr_model_best.pth")
         
         scheduler.step(test_loss)
     
@@ -652,8 +395,8 @@ def main():
         'optimizer_state_dict': optimizer.state_dict(),
         'label_encoder': lbl_enc,
         'num_classes': len(lbl_enc.classes_)
-    }, "models/ocr_model_final.pth")
-    print("Final model saved successfully as models/ocr_model_final.pth")
+    }, "ocr_model_final.pth")
+    print("Final model saved successfully as ocr_model_final.pth")
 
 
 if __name__ == "__main__":

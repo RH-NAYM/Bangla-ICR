@@ -20,6 +20,9 @@ img/
 *.psd
 *.json
 
+*.pth
+models/
+
 # C extensions
 *.so
 

@@ -6,7 +6,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 
 # Import the model class definition
-from train import OCRModel, remove_duplicates
+from train import ComplexOCRModel, remove_duplicates
 
 
 
@@ -116,7 +116,7 @@ def main():
     num_classes = checkpoint['num_classes']
     
     # Initialize model
-    model = OCRModel(num_classes)
+    model = ComplexOCRModel(num_classes)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
